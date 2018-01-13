@@ -7,7 +7,7 @@
 
 # In[1]:
 
-
+import os
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
@@ -15,9 +15,10 @@ from torch import optim
 import torch.nn.functional as F
 
 #get_ipython().magic(u'matplotlib inline')
-#get_ipython().magic(u'env CUDA_VISIBLE_DEVICES=1')
+#get_ipython().magic(u'env CUDA_VISIBLE_DEVICES=0')
 
-USE_CUDA = False #torch.cuda.is_available()
+USE_CUDA = torch.cuda.is_available()
+os.environ['env CUDA_VISIBLE_DEVICES']='1'
 
 
 # **Build recurrent anttention based model**
@@ -96,20 +97,25 @@ class AttendAndPredict(nn.Module):
         
         seq_len = M.size()[0]
         batch_size = M.size()[1]
-        
-        print(hidden.size())
+
         # convert to batch first
         M = M.permute(1,0,2)
         hidden = hidden.permute(1,0,2)
 
-        energies = self._score(hidden, M)
-        a = F.softmax(energies)
-        print('a size {} M size {}'.format(a.size(), M.size()))
-        c = a.permute(0,2,1).bmm(M) #bmm(a.permute(0,2,1))
-        print('c size {} hidden size {}'.format(c.size(), hidden.size()))
+        if USE_CUDA:
+            energies = Variable(torch.zeros(batch_size, seq_len)).cuda()
+        else:
+            energies = Variable(torch.zeros(batch_size, seq_len))
+        
+        energies[:] = self._score(hidden, M)
+            
+        #for i in range(seq_len):
+        #    energies[i] = self._score(hidden, M[i])
+        a = F.softmax(energies).unsqueeze(1)
+        c = a.bmm(M)
         next_timestep_prediction = self.fc_out(torch.cat((c.squeeze(1), hidden.squeeze(1)), 1))
         
-        return next_timestep_prediction, a
+        return next_timestep_prediction
         
     def _score(self, hidden, M):
         """
@@ -133,48 +139,64 @@ class AttendAndPredict(nn.Module):
         return energy
 
 
+# ** Training procedure**
+
+# Train per time window
 
 # In[4]:
 
 
-class SeqRnnAttnAndPred(nn.Module):
+def train(input_seq, seqrnn_model, atten_model, memory_size, criterion, optimizer):
     """
-    SequenceAttnPred - Recurrent Atteniton based model for predicting next time step.
+    Train for a given sequence batch size.
+    Args:
+    input_seq(batch_size,seq_len,input_size): tensor containin sequences.
+    seqrnn_model: input model - batch is first dim.
+    memory_size: size of matrix to attend over.
+    criterion: distance measure i.e. l1, l2 etc.
+    optimizer: GD, ADAM etc.
     """
-    def __init__(self, input_size, hidden_size, output_size, batch_size,
-                 rnn_layers=1, atnn_method='general', memory_size=-1):
-        """
-        args:
-        input_size: size of elemnt of sequnece.
-        hidden_size: size of hidden state of RNN (same as output if only 1 RNN).
-        output_size: size of output tensor.
-        rnn_layers: amount of stacked RNN's (see any basic seq2seq paper).
-        atnn_method: type of attention to use.
-        memory_size: amount of rnn output's to aggregate and attend over.
-        """
-        super(SeqRnnAttnAndPred, self).__init__()
-        self._rnn_layer = SequencePredRNN(input_size, hidden_size, rnn_layers)
-        self._atnn_layer = AttendAndPredict(atnn_method, hidden_size, output_size)
-        self._memory_size = memory_size
-        self._batch_size = batch_size
-        self._hidden = Variable(torch.zeros(1, batch_size, hidden_size))
-        self._hidden = self._hidden.cuda() if USE_CUDA else self._hidden
-        
-    def forward(self, inputs):
-        """
-        args:
-        inputs(seq_len,batch,input_len): input sequence predict seq_len + 1
-        """
-        seq_len = inputs.size()[0]
-        
-        # in case of 1 rnn layer output == hidden.
-        seqrnn_output, self._hidden = self._rnn_layer(inputs, self._hidden)
-        self.memory = seqrnn_output[-self._memory_size-1:-1]
-        self._hidden = seqrnn_output[-1].unsqueeze(0)
-        outputs, alignment = self._atnn_layer(self._hidden, self.memory)
-        return outputs, alignment
-   
 
+    def initHidden(self):
+        result = Variable(torch.zeros(1, 1, self.hidden_size))
+        if USE_CUDA:
+            return result.cuda()
+        else:
+            return result
+   
+    seq_len = input_seq.size()[0] 
+    batch_size = input_seq.size()[1]
+    input_len = input_seq.size()[2]
+
+    assert memory_size < seq_len, 'memory should be smaller than total seq'
+
+    seq_rnn_hidden = Variable(torch.zeros(1, batch_size, input_len))
+    seqrnn_output = Variable(torch.zeros(seq_len, batch_size, seqrnn_model.hidden_size))
+    seq_rnn_hidden = seq_rnn_hidden.cuda() if USE_CUDA else seq_rnn_hidden
+    seqrnn_model = seqrnn_model.cuda() if USE_CUDA else seqrnn_model
+    
+    
+    seqrnn_model.zero_grad()
+    atten_model.zero_grad()
+    loss = 0
+    
+    #
+    # Start prediction from time t + memory_size till time T - memory_size
+    seqrnn_output[:], seq_rnn_hidden = seqrnn_model(input_seq, seq_rnn_hidden) # in case of 1 rnn layer output == hidden.
+    for t in range(seq_len - memory_size):
+        M = seqrnn_output[t:memory_size+t]# memory matrix i.e. attend over
+        h = seqrnn_output[memory_size+t].unsqueeze(0) # current rnn pred
+        preds = atten_model(h, M)
+        loss += criterion(preds, input_seq[memory_size+t])
+        
+    loss.backward()
+    optimizer.step()
+    
+    return loss.data[0] / ((seq_len - memory_size)*batch_size)
+        
+
+
+# This is a helper function to print time elapsed and estimated time remaining given the current time and progress %.
 
 # In[5]:
 
@@ -197,56 +219,29 @@ def timeSince(since, percent):
     return '%s (- %s)' % (asMinutes(s), asMinutes(rs))
 
 
-# ** Training procedure**
-
-# Train per time window
+# Full train procedure
 
 # In[6]:
 
 
-def train(input_seq, model, criterion, optimizer):
-    """
-    Train for a given sequence batch size.
-    Args:
-    input_seq(batch_size,seq_len,input_size): tensor containin sequences.
-    model: input model - batch is first dim.
-    criterion: distance measure i.e. l1, l2 etc.
-    optimizer: GD, ADAM etc.
-    """  
-    preds, alignment = model(input_seq[:-1])
-    loss = criterion(preds, input_seq[-1])
-    print(loss)
-    model.zero_grad()
-    loss.backward()
-    optimizer.step()
-    
-    return loss.data[0]
-        
-
-
-# This is a helper function to print time elapsed and estimated time remaining given the current time and progress %.
-
-# Full train procedure
-
-# In[7]:
-
-
-def trainIters(train_data, model, n_iters, print_every=1000, plot_every=100, learning_rate=0.01):
+def trainIters(train_data, recurrent_model, attention_model, n_iters,
+               print_every=1000, plot_every=100, learning_rate=0.01):
     
     start = time.time()
     plot_losses = []
     print_loss_total = 0  # Reset every print_every
     plot_loss_total = 0  # Reset every plot_every
 
-    optimizer = optim.SGD(model.parameters(), lr=learning_rate)
-    criterion = nn.MSELoss().cuda()
+    optimizer = optim.SGD(nn.ModuleList([recurrent_model, attention_model]).parameters(), lr=learning_rate)
+    training_pairs = [] # TODO: Need to add functionatly here
+    criterion = nn.L1Loss()
 
     for iter in range(1, n_iters + 1):
         
         input_variable = train_data[iter,:].unsqueeze(-1).unsqueeze(-1)
-        double_batch_input = torch.cat((input_variable,input_variable),1)
-        
-        loss = train(double_batch_input, model, criterion, optimizer)
+
+        loss = train(torch.cat((input_variable,input_variable),1), recurrent_model,
+                     attention_model, 10, criterion, optimizer)
         print_loss_total += loss
         plot_loss_total += loss
 
@@ -264,7 +259,7 @@ def trainIters(train_data, model, n_iters, print_every=1000, plot_every=100, lea
     showPlot(plot_losses)
 
 
-# In[8]:
+# In[7]:
 
 
 import matplotlib.pyplot as plt
@@ -283,7 +278,7 @@ def show_plot(points):
 
 # Temprorery gen syntetic data for debugging model
 
-# In[9]:
+# In[8]:
 
 
 import numpy as np
@@ -292,36 +287,29 @@ T = 20
 L = 1000
 N = 100
 
-x = np.empty((N, L), 'float32')
+x = np.empty((N, L), 'int64')
 x[:] = np.array(range(L)) + np.random.randint(-4 * T, 4 * T, N).reshape(N, 1)
 data = Variable(torch.from_numpy(np.sin(x / 1.0 / T).astype('float32')), requires_grad=False)
 data = data.cuda() if USE_CUDA else data
 
+# In[9]:
 
-# In[10]:
 
-
-print('example data shape: '.format(data.size()))
+print('example data')
 show_plot(data[1,:].data.cpu().numpy())
 
 
 # ** Main Entry Point **
 
-# In[11]:
+# In[10]:
 
 
 hidden_size = 1
-seq_attn_pred = SeqRnnAttnAndPred(input_size=1, hidden_size=1, output_size=1, batch_size=2,
-                  rnn_layers=1, atnn_method='general', memory_size=10)
+seqrnn = SequencePredRNN(1, 1)
+attn = AttendAndPredict('general', 1, 1)
 
 if USE_CUDA:
-    seq_attn_pred = seq_attn_pred.cuda()
+    seqrnn = seqrnn.cuda()
+    attn = attn.cuda()
 
-trainIters(data, seq_attn_pred, 75000, print_every=5000)
-
-
-# In[ ]:
-
-
-
-
+trainIters(data, seqrnn, attn, 75000, print_every=5000)
